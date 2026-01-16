@@ -25,7 +25,6 @@ static const float BUBBLE_MAX_RESTITUTION  = 1.0f;
 static const float BUBBLE_MIN_POP          = 0.0f;
 static const float BUBBLE_MAX_POP          = 1.0f;
 
-
 // --- Physics ----------------------------------------------------------------
 
 typedef struct {
@@ -42,6 +41,14 @@ typedef struct {
     int spawn_cooldown; // frames to skip collisions after spawn/respawn
     float pop_chance;   // 0..1 chance to "pop" on collision
     bool popped;        // flagged for respawn after physics step
+
+    // Wobble for floaty motion
+    float wobble_phase;     // radians
+    float wobble_speed;     // radians per second
+    float wobble_amplitude; // px
+
+    // Pop animation timer: >0 = animating pop
+    int pop_anim_timer;
 } PhysicsBody;
 
 typedef struct {
@@ -81,6 +88,9 @@ static float rng_next_float01(SimpleRng* rng) {
     return (float)(rng_next(rng) & 0x00FFFFFFu) / (float)0x01000000u;
 }
 
+// Pop animation length in frames
+#define POP_ANIM_FRAMES 8
+
 // Physics step now has access to RNG for pop chance
 static void physics_step(
     PhysicsBody* bodies,
@@ -93,14 +103,28 @@ static void physics_step(
     if(dt <= 0.0f) return;
     if(!bodies || count == 0) return;
 
+    const float TWO_PI = 6.2831853f;
+
     // 1) Integrate velocities and positions
     for(size_t i = 0; i < count; i++) {
         PhysicsBody* b = &bodies[i];
+
+        // If we're in pop animation, just tick the timer and skip integration
+        if(b->pop_anim_timer > 0) {
+            b->pop_anim_timer--;
+            continue;
+        }
 
         if(b->inv_mass > 0.0f && !b->popped) {
             // apply acceleration + gravity
             b->vy += (b->ay + gravity_y) * dt;
             b->vx += b->ax * dt;
+
+            // Wobble for floaty motion
+            b->wobble_phase += b->wobble_speed * dt;
+            if(b->wobble_phase > TWO_PI) b->wobble_phase -= TWO_PI;
+            float wobble = sinf(b->wobble_phase) * b->wobble_amplitude;
+            b->x += wobble * dt;
 
             b->x += b->vx * dt;
             b->y += b->vy * dt;
@@ -127,13 +151,13 @@ static void physics_step(
     // 2) Naive O(n^2) circle–circle collision resolution
     for(size_t i = 0; i < count; i++) {
         PhysicsBody* a = &bodies[i];
-        if(a->popped) continue; // skip popped bodies
+        if(a->popped || a->pop_anim_timer > 0) continue; // skip popped / animating
 
         bool vis_a = body_is_visible_vertical(a, bounds);
 
         for(size_t j = i + 1; j < count; j++) {
             PhysicsBody* b = &bodies[j];
-            if(b->popped) continue; // skip popped bodies
+            if(b->popped || b->pop_anim_timer > 0) continue; // skip popped / animating
 
             bool vis_b = body_is_visible_vertical(b, bounds);
 
@@ -220,6 +244,7 @@ static void physics_step(
                     // Pop the smaller bubble (feels a bit more natural)
                     PhysicsBody* victim = (a->radius <= b->radius) ? a : b;
                     victim->popped = true;
+                    victim->pop_anim_timer = POP_ANIM_FRAMES;
                 }
             }
         }
@@ -366,7 +391,7 @@ static void bubble_app_init_groups(BubbleApp* app) {
     app->groups[0].radius = 3.0f;
     app->groups[0].rise_speed = 60.0f;
     app->groups[0].restitution = 0.8f;
-    app->groups[0].pop_chance = 1.0f; // default: no popping
+    app->groups[0].pop_chance = 1.0f; // default: no popping?
 
     app->groups[1].name = "Medium";
     app->groups[1].count = 10;
@@ -381,6 +406,15 @@ static void bubble_app_init_groups(BubbleApp* app) {
     app->groups[2].rise_speed = 4.0f;
     app->groups[2].restitution = 0.05f;
     app->groups[2].pop_chance = 0.10f;
+}
+
+// Helper: initialize wobble parameters for a bubble
+static void bubble_init_wobble(BubbleApp* app, PhysicsBody* b) {
+    // Slightly stronger wobble for larger groups
+    float base_amp = 1.0f + (float)b->group; // 1,2,3 by group
+    b->wobble_phase = rng_next_float01(&app->rng) * 6.2831853f;
+    b->wobble_speed = 0.5f + rng_next_float01(&app->rng) * 0.7f; // 0.5–1.2 rad/s
+    b->wobble_amplitude = base_amp;
 }
 
 // Rebuild all bodies based on group configs
@@ -401,6 +435,7 @@ static void bubble_app_build_bodies(BubbleApp* app) {
             b->group = g;
             b->pop_chance = cfg->pop_chance;
             b->popped = false;
+            b->pop_anim_timer = 0;
 
             float r = b->radius;
 
@@ -424,6 +459,8 @@ static void bubble_app_build_bodies(BubbleApp* app) {
             b->ax = 0.0f;
             b->ay = 0.0f;
             b->spawn_cooldown = SPAWN_COOLDOWN_FRAMES;
+
+            bubble_init_wobble(app, b);
         }
     }
 }
@@ -456,6 +493,7 @@ static void bubble_app_reinit_group(BubbleApp* app, int group_id) {
         b->group = group_id;
         b->pop_chance = cfg->pop_chance;
         b->popped = false;
+        b->pop_anim_timer = 0;
 
         float r = b->radius;
 
@@ -476,6 +514,8 @@ static void bubble_app_reinit_group(BubbleApp* app, int group_id) {
         b->ax = 0.0f;
         b->ay = 0.0f;
         b->spawn_cooldown = SPAWN_COOLDOWN_FRAMES;
+
+        bubble_init_wobble(app, b);
     }
 }
 
@@ -503,9 +543,36 @@ static void bubble_respawn_body(BubbleApp* app, PhysicsBody* b) {
     b->ay = 0.0f;
     b->spawn_cooldown = SPAWN_COOLDOWN_FRAMES;
     b->popped = false;
+    b->pop_anim_timer = 0;
+
+    bubble_init_wobble(app, b);
 }
 
 // --- Drawing ----------------------------------------------------------------
+
+static void bubble_draw_body(Canvas* canvas, const PhysicsBody* b, bool selected);
+
+static void bubble_draw_pop(Canvas* canvas, const PhysicsBody* b) {
+    int x = (int)(b->x + 0.5f);
+    int y = (int)(b->y + 0.5f);
+    int base_r = (int)(b->radius + 0.5f);
+    if(base_r < 1) base_r = 1;
+
+    int t = b->pop_anim_timer;
+    if(t <= 0) return;
+
+    // POP_ANIM_FRAMES .. 1
+    float alpha = (float)t / (float)POP_ANIM_FRAMES; // 1 -> 0
+    int r_outer = base_r + (int)((1.0f - alpha) * 4.0f + 0.5f);
+
+    // Outer ring
+    canvas_draw_circle(canvas, x, y, r_outer);
+
+    // Inner ring early in the animation to look like fragments
+    if(t > POP_ANIM_FRAMES / 2 && r_outer > 2) {
+        canvas_draw_circle(canvas, x, y, r_outer - 2);
+    }
+}
 
 static void bubble_draw_body(Canvas* canvas, const PhysicsBody* b, bool selected) {
     int x = (int)(b->x + 0.5f);
@@ -516,14 +583,25 @@ static void bubble_draw_body(Canvas* canvas, const PhysicsBody* b, bool selected
     if(x + r < 0 || x - r >= SCREEN_W) return;
     if(y + r < 0 || y - r >= SCREEN_H) return;
 
-    // Selected group gets a thicker border: draw 2 concentric circles
+    // 1) Main bubble outline
+    canvas_draw_circle(canvas, x, y, r);
+
+    // 2) Inner rim to suggest bubble thickness
+    if(r > 3) {
+        canvas_draw_circle(canvas, x, y, r - 2);
+    }
+
+    // 3) Highlight near top-left to sell "glossy bubble"
+    if(r >= 3) {
+        int hx = x - r / 3;
+        int hy = y - r / 3;
+        // Small highlight dot (approximate with a tiny circle)
+        canvas_draw_circle(canvas, hx, hy, 1);
+    }
+
+    // 4) Selected group: subtle extra ring for visibility
     if(selected) {
-        canvas_draw_circle(canvas, x, y, r);
-        if(r > 1) {
-            canvas_draw_circle(canvas, x, y, r - 1);
-        }
-    } else {
-        canvas_draw_circle(canvas, x, y, r);
+        canvas_draw_circle(canvas, x, y, r + 1);
     }
 }
 
@@ -534,9 +612,19 @@ static void bubble_draw(Canvas* canvas, void* ctx) {
     // Draw bodies only
     for(size_t i = 0; i < app->body_count; i++) {
         const PhysicsBody* b = &app->bodies[i];
-        // When HUD is hidden, we don't visually highlight the selected group
+
+        // If we're popped but waiting for respawn, don't draw bubble body
+        if(b->popped && b->pop_anim_timer <= 0) {
+            continue;
+        }
+
         bool selected = app->hud_visible && (b->group == app->selected_group);
-        bubble_draw_body(canvas, b, selected);
+
+        if(b->popped && b->pop_anim_timer > 0) {
+            bubble_draw_pop(canvas, b);
+        } else {
+            bubble_draw_body(canvas, b, selected);
+        }
     }
 
     // Footer: show which field is being edited + value (only if HUD visible)
@@ -556,14 +644,16 @@ static void bubble_draw(Canvas* canvas, void* ctx) {
             case ConfigFieldSpeed:
                 snprintf(buf, sizeof(buf), "Speed=%.2f", (double)cfg->rise_speed);
                 break;
-            case ConfigFieldRestitution:
+            case ConfigFieldRestitution: {
                 int res = (int)(cfg->restitution * 100.0f + 0.5f); // round to nearest int
                 snprintf(buf, sizeof(buf), "Bounce=%d%%", res);
                 break;
-            case ConfigFieldPopChance:
+            }
+            case ConfigFieldPopChance: {
                 int pct = (int)(cfg->pop_chance * 100.0f + 0.5f); // round to nearest int
                 snprintf(buf, sizeof(buf), "Pop=%d%%", pct);
-		break;
+                break;
+            }
             default:
                 snprintf(buf, sizeof(buf), "?");
                 break;
@@ -630,7 +720,6 @@ static void bubble_adjust_field(BubbleApp* app, int dir) {
             break;
     }
 }
-
 
 static void bubble_handle_input(BubbleApp* app, InputEvent* in, bool* running) {
     // First, handle long-press OK to toggle HUD visibility
@@ -745,10 +834,10 @@ int32_t bubble_sim_app(void* p) {
         const float dt = 0.03f; // ~30 ms
         physics_step(app->bodies, app->body_count, dt, app->gravity_y, &app->bounds, &app->rng);
 
-        // Handle popped bubbles: respawn them
+        // Handle popped bubbles: respawn them only after pop animation finishes
         for(size_t i = 0; i < app->body_count; i++) {
             PhysicsBody* b = &app->bodies[i];
-            if(b->popped) {
+            if(b->popped && b->pop_anim_timer <= 0) {
                 bubble_respawn_body(app, b);
             }
         }
@@ -756,7 +845,8 @@ int32_t bubble_sim_app(void* p) {
         // If a bubble floats off the top, respawn well below the screen
         for(size_t i = 0; i < app->body_count; i++) {
             PhysicsBody* b = &app->bodies[i];
-            if(b->y + b->radius < app->bounds.min_y - 20.0f) {
+            if(!b->popped && b->pop_anim_timer <= 0 &&
+               (b->y + b->radius < app->bounds.min_y - 20.0f)) {
                 bubble_respawn_body(app, b);
             }
         }
